@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Воспламенение 1.0</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.6/standalone/umd/vis-network.min.js"></script>
+<style>
+:root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --input: #21262d;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, 'Segoe UI', sans-serif; }
+
+.topbar {
+    background: var(--card); border-bottom: 1px solid var(--border);
+    padding: 12px 24px; display: flex; justify-content: space-between; align-items: center;
+}
+.topbar h1 { font-size: 18px; color: var(--accent); }
+.stats { display: flex; gap: 16px; font-size: 13px; color: var(--muted); }
+.stats b { color: var(--text); }
+
+.tabs { display: flex; background: var(--card); border-bottom: 1px solid var(--border); padding: 0 24px; }
+.tab {
+    padding: 10px 20px; cursor: pointer; color: var(--muted); font-weight: 500;
+    border-bottom: 2px solid transparent; transition: .15s;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.main { padding: 16px 24px; }
+.hidden { display: none !important; }
+.panel { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.panel h3 { font-size: 15px; color: var(--accent); margin-bottom: 12px; }
+
+.graph-layout { display: grid; grid-template-columns: 1fr 380px; gap: 16px; }
+@media (max-width: 1100px) { .graph-layout { grid-template-columns: 1fr; } }
+
+#graph-box {
+    width: 100%; height: 560px;
+    background: #010409; border: 1px solid var(--border); border-radius: 8px;
+}
+#trace-box {
+    background: #010409; border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; height: 560px; overflow-y: auto;
+    font-family: 'Consolas', 'Fira Code', monospace; font-size: 12px; color: #c9d1d9;
+}
+#trace-box .tl { padding: 3px 6px; margin: 2px 0; border-radius: 3px; line-height: 1.5; }
+#trace-box .tl:hover { background: rgba(88,166,255,.08); }
+#trace-box .tl.seed { color: var(--orange); font-weight: 600; }
+#trace-box .tl.tick { color: var(--accent); font-weight: 600; }
+#trace-box .tl.spread { color: #8b949e; }
+#trace-box .tl.stop { color: var(--red); }
+#trace-box .tl.ok { color: var(--green); }
+
+.chat-layout { display: grid; grid-template-columns: 1fr 380px; gap: 16px; }
+@media (max-width: 1100px) { .chat-layout { grid-template-columns: 1fr; } }
+#chat-msgs {
+    background: #010409; border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px; height: 520px; overflow-y: auto; font-size: 14px; line-height: 1.55;
+}
+.msg-user {
+    color: #79c0ff !important; background: rgba(88,166,255,.06);
+    border-left: 3px solid var(--accent); padding: 8px 12px; margin: 8px 0; border-radius: 6px;
+}
+.msg-agent {
+    color: #e6edf3 !important; background: rgba(63,185,80,.04);
+    border-left: 3px solid var(--green); padding: 8px 12px; margin: 8px 0; border-radius: 6px;
+}
+.msg-sys { color: var(--orange) !important; font-size: 13px; padding: 6px 10px; margin: 6px 0; }
+.msg-err { color: var(--red) !important; border-left-color: var(--red) !important; }
+
+#chat-trace {
+    background: #010409; border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; height: 520px; overflow-y: auto;
+    font-family: 'Consolas', monospace; font-size: 12px; color: #c9d1d9;
+}
+
+input[type=text], textarea, select {
+    background: var(--input); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 12px; width: 100%; font-size: 14px;
+}
+input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+label { color: var(--muted); font-size: 12px; margin-bottom: 4px; display: block; }
+
+.btn { padding: 8px 16px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
+.btn-blue { background: var(--accent); color: #0d1117; }
+.btn-blue:hover { background: #79c0ff; }
+.btn-green { background: var(--green); color: #0d1117; }
+.btn-green:hover { background: #56d364; }
+.btn-gray { background: #30363d; color: var(--text); }
+.btn-gray:hover { background: #484f58; }
+
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 900px) { .row2 { grid-template-columns: 1fr; } }
+
+.toolbar { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; align-items: center; }
+.legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px; color: var(--muted); margin-top: 8px; }
+.legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 4px; vertical-align: middle; }
+.badge { display: inline-block; background: rgba(88,166,255,.15); color: var(--accent); padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 6px; }
+
+#sys-log {
+    background: #010409; border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; height: 500px; overflow-y: auto;
+    font-family: 'Consolas', monospace; font-size: 12px; color: #c9d1d9; white-space: pre-wrap;
+}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+    <h1>🔥 Воспламенение 1.0</h1>
+    <div class="stats">
+        <span>S=<b id="sS">0</b></span>
+        <span>C=<b id="sC">0</b></span>
+        <span>P=<b id="sP">0</b></span>
+        <span>H=<b id="sH">0</b></span>
+        <span>L=<b id="sL">0</b></span>
+    </div>
+</div>
+
+<div class="tabs">
+    <div class="tab active" data-t="graph">🕸 Граф</div>
+    <div class="tab" data-t="agent">🤖 Агент</div>
+    <div class="tab" data-t="facts"> Факты</div>
+    <div class="tab" data-t="log">📋 Лог</div>
+</div>
+
+<div class="main">
+
+<div id="p-graph">
+    <div class="panel">
+        <h3>Когнитивный граф</h3>
+        <div class="toolbar">
+            <input type="text" id="g-search" placeholder="Поиск узла…" style="max-width:240px">
+            <button class="btn btn-blue" onclick="loadGraph()">🔄 Обновить</button>
+            <button class="btn btn-gray" onclick="resetHL()">✨ Сброс подсветки</button>
+            <button class="btn btn-gray" onclick="exportPNG()">📷 PNG</button>
+        </div>
+        <div class="graph-layout">
+            <div>
+                <div id="graph-box"></div>
+                <div class="legend">
+                    <span><i style="background:#87CEEB"></i>Символ</span>
+                    <span><i style="background:#90EE90"></i>Факт</span>
+                    <span><i style="background:#ff9800"></i>Seed</span>
+                    <span><i style="background:#ffeb3b"></i>Активирован</span>
+                </div>
+            </div>
+            <div>
+                <div style="font-size:13px;color:var(--accent);margin-bottom:8px;font-weight:600">📜 Трассировка</div>
+                <div id="trace-box">Ожидание запуска…</div>
+            </div>
+        </div>
+    </div>
+    <div class="panel">
+        <h3>🔥 Воспламенение</h3>
+        <div style="display:flex;gap:10px;align-items:end;flex-wrap:wrap">
+            <div style="flex:1;min-width:260px">
+                <label>Seed-концепты (через запятую)</label>
+                <input type="text" id="seed-in" placeholder="митохондрия, энергия, клетка">
+            </div>
+            <button class="btn btn-blue" onclick="doIgnite()">ВОСПЛАМЕНИТЬ</button>
+        </div>
+    </div>
+</div>
+
+<div id="p-agent" class="hidden">
+    <div class="panel">
+        <h3> Когнитивный агент</h3>
+        <div class="chat-layout">
+            <div>
+                <div id="chat-msgs">
+                    <div class="msg-agent">🤖 Здравствуйте! Задайте вопрос — я найду ответ в ассоциативной памяти.</div>
+                </div>
+                <div style="margin-top:10px;display:flex;gap:8px">
+                    <input type="text" id="chat-in" placeholder="Задайте вопрос…" onkeydown="if(event.key==='Enter')askAgent()">
+                    <button class="btn btn-blue" onclick="askAgent()">Спросить</button>
+                </div>
+            </div>
+            <div>
+                <div style="font-size:13px;color:var(--accent);margin-bottom:8px;font-weight:600">📜 Трассировка на графе</div>
+                <div id="chat-trace">Задайте вопрос, чтобы увидеть трассировку…</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="p-facts" class="hidden">
+    <div class="row2">
+        <div class="panel">
+            <h3>✨ Извлечь из предложения <span class="badge">LLM</span></h3>
+            <label>Предложение</label>
+            <textarea id="f-sent" rows="3" placeholder="Митохондрии производят энергию для клетки"></textarea>
+            <button class="btn btn-green" style="margin-top:10px" onclick="extractFact()">Извлечь факт</button>
+            <div id="f-res" style="margin-top:10px;font-size:13px"></div>
+        </div>
+        <div class="panel">
+            <h3>✍ Ручной ввод</h3>
+            <label>Шаблон</label>
+            <select id="f-tmpl">
+                <option value="PRODUCE">PRODUCE</option>
+                <option value="DISCOVER">DISCOVER</option>
+                <option value="LOCATE">LOCATE</option>
+                <option value="CAUSE_EFFECT">CAUSE_EFFECT</option>
+                <option value="CREATE">CREATE</option>
+                <option value="CLASSIFY">CLASSIFY (IS-A)</option>
+                <option value="INTERACT">INTERACT</option>
+            </select>
+            <div style="margin-top:8px"><label>Предикат</label><input id="f-pred" placeholder="производить"></div>
+            <div style="margin-top:8px"><label>Субъект</label><input id="f-subj" placeholder="митохондрия"></div>
+            <div style="margin-top:8px"><label>Объект</label><input id="f-obj" placeholder="энергия"></div>
+            <button class="btn btn-blue" style="margin-top:12px" onclick="addFactMan()">Сохранить</button>
+            <div id="f-man-res" style="margin-top:10px;font-size:13px"></div>
+        </div>
+    </div>
+</div>
+
+<div id="p-log" class="hidden">
+    <div class="panel">
+        <h3>📋 Системный лог</h3>
+        <button class="btn btn-gray" onclick="refreshLog()">🔄 Обновить</button>
+        <div id="sys-log" style="margin-top:10px">Загрузка…</div>
+    </div>
+</div>
+
+</div>
+
+<script>
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    const n = t.dataset.t;
+    ['graph','agent','facts','log'].forEach(x =>
+        document.getElementById('p-'+x).classList.toggle('hidden', x !== n));
+    if (n === 'log') refreshLog();
+    if (n === 'graph' && !network) loadGraph();
+}));
+
+let network = null, nodesDS = null, edgesDS = null;
+const BASE_COLORS = { symbol: '#87CEEB', fact: '#90EE90' };
+
+async function loadGraph() {
+    const q = document.getElementById('g-search').value.trim();
+    try {
+        const r = await fetch('/api/graph?search=' + encodeURIComponent(q));
+        const d = await r.json();
+        if (d.status !== 'ok') { alert(d.message); return; }
+
+        nodesDS = new vis.DataSet(d.nodes.map(n => ({
+            id: n.id, label: n.label, type: n.type,
+            color: { background: n.color, border: '#30363d',
+                     highlight: { background: '#ffeb3b', border: '#ff9800' } },
+            font: { color: '#e6edf3', size: 14, face: 'Segoe UI, sans-serif',
+                    strokeWidth: 3, strokeColor: '#010409' }
+        })));
+        edgesDS = new vis.DataSet(d.edges.map(e => ({
+            from: e.from, to: e.to, label: e.label, width: e.width,
+            arrows: 'to',
+            font: { color: '#8b949e', size: 10, align: 'middle', strokeWidth: 0 }
+        })));
+
+        const options = {
+            nodes: { shape: 'dot', scaling: { min: 15, max: 40 } },
+            edges: { color: { color: '#30363d', highlight: '#58a6ff' },
+                     smooth: { type: 'continuous', forceDirection: 'none', roundness: 0.2 } },
+            physics: {
+                enabled: true, solver: 'barnesHut',
+                barnesHut: { gravitationalConstant: -8000, centralGravity: 0.5,
+                             springLength: 150, springConstant: 0.08, damping: 0.6, avoidOverlap: 0.2 },
+                stabilization: { enabled: true, iterations: 300, updateInterval: 50, fit: true },
+                maxVelocity: 30, minVelocity: 1.0, timestep: 0.4
+            },
+            interaction: { hover: true, tooltipDelay: 200, dragNodes: true, dragView: true, zoomView: true }
+        };
+
+        network = new vis.Network(
+            document.getElementById('graph-box'),
+            { nodes: nodesDS, edges: edgesDS }, options
+        );
+
+        network.on('stabilizationDone', function() {
+            console.log('✅ Граф стабилизирован');
+            network.setOptions({ physics: { enabled: false } });
+            if (q && d.nodes.length > 0) {
+                setTimeout(() => {
+                    network.fit({
+                        nodes: d.nodes.map(n => n.id),
+                        animation: { duration: 500, easingFunction: 'easeInOutQuad' }
+                    });
+                }, 100);
+            }
+        });
+
+        setTimeout(() => {
+            if (network && network.body && network.body.physics) {
+                if (network.body.physics.simulationRunning || !network.body.physics.stabilized) {
+                    console.log('⚠ Принудительная остановка физики');
+                    network.setOptions({ physics: { enabled: false } });
+                }
+            }
+        }, 8000);
+
+    } catch (e) { alert('Ошибка графа: ' + e.message); console.error(e); }
+}
+
+function resetHL() {
+    if (!nodesDS) return;
+    nodesDS.update(nodesDS.get().map(n => ({
+        id: n.id,
+        color: { background: BASE_COLORS[n.type] || '#87CEEB', border: '#30363d',
+                 highlight: { background: '#ffeb3b', border: '#ff9800' } },
+        font: { color: '#e6edf3', size: 14, strokeWidth: 3, strokeColor: '#010409' },
+        borderWidth: 1
+    })));
+}
+
+function highlightNodes(uids, color) {
+    if (!nodesDS || !uids || !uids.length) return;
+    resetHL();
+    const upd = [];
+    uids.forEach(uid => {
+        if (nodesDS.get(String(uid))) {
+            upd.push({
+                id: String(uid),
+                color: { background: color, border: '#ff5722',
+                         highlight: { background: color, border: '#ff5722' } },
+                font: { color: '#0d1117', size: 16, bold: true, strokeWidth: 0 },
+                borderWidth: 3
+            });
+        }
+    });
+    if (upd.length) nodesDS.update(upd);
+}
+
+function showTraceGraph(traceData) {
+    if (!traceData || !traceData.nodes || traceData.nodes.length === 0) return;
+
+    const seedSet = new Set((traceData.seed_uids || []).map(String));
+
+    nodesDS = new vis.DataSet(traceData.nodes.map(n => ({
+        id: n.id, label: n.label, type: n.type,
+        color: {
+            background: seedSet.has(n.id) ? '#ff9800' : (n.type === 'symbol' ? '#87CEEB' : '#90EE90'),
+            border: '#30363d',
+            highlight: { background: '#ffeb3b', border: '#ff9800' }
+        },
+        font: {
+            color: '#e6edf3', size: seedSet.has(n.id) ? 16 : 14,
+            face: 'Segoe UI, sans-serif',
+            strokeWidth: 3, strokeColor: '#010409', bold: seedSet.has(n.id)
+        },
+        borderWidth: seedSet.has(n.id) ? 3 : 1
+    })));
+
+    edgesDS = new vis.DataSet(traceData.edges.map(e => ({
+        from: e.from, to: e.to, label: e.label, width: e.width || 2,
+        color: e.color || { color: '#868e96', highlight: '#ff9800' },
+        font: e.font || { color: '#e6edf3', size: 11, strokeWidth: 2, strokeColor: '#010409' },
+        arrows: e.arrows || 'to',
+        smooth: { type: 'continuous', roundness: 0.2 }
+    })));
+
+    const options = {
+        nodes: {
+            shape: 'dot', scaling: { min: 15, max: 40 },
+            font: { color: '#e6edf3', size: 14, face: 'Segoe UI, sans-serif',
+                    strokeWidth: 3, strokeColor: '#010409' }
+        },
+        edges: { smooth: { type: 'continuous', forceDirection: 'none', roundness: 0.2 } },
+        physics: {
+            enabled: true, solver: 'barnesHut',
+            barnesHut: { gravitationalConstant: -5000, centralGravity: 0.4,
+                         springLength: 100, springConstant: 0.05, damping: 0.5, avoidOverlap: 0.15 },
+            stabilization: { enabled: true, iterations: 150, updateInterval: 50, fit: true },
+            maxVelocity: 25, minVelocity: 0.75, timestep: 0.4
+        },
+        interaction: { hover: true, tooltipDelay: 200 }
+    };
+
+    network = new vis.Network(
+        document.getElementById('graph-box'),
+        { nodes: nodesDS, edges: edgesDS }, options
+    );
+
+    network.on('stabilizationDone', function() {
+        network.setOptions({ physics: { enabled: false } });
+    });
+
+    setTimeout(() => {
+        if (network && network.body && network.body.physics) {
+            if (network.body.physics.simulationRunning) {
+                network.setOptions({ physics: { enabled: false } });
+            }
+        }
+    }, 5000);
+
+    // Переключаемся на вкладку графа
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelector('.tab[data-t="graph"]').classList.add('active');
+    ['graph','agent','facts','log'].forEach(x =>
+        document.getElementById('p-'+x).classList.toggle('hidden', x !== 'graph'));
+}
+
+function exportPNG() {
+    const c = document.querySelector('#graph-box canvas');
+    if (!c) return;
+    const a = document.createElement('a');
+    a.download = 'graph.png'; a.href = c.toDataURL('image/png'); a.click();
+}
+
+function renderTrace(lines, container) {
+    if (!lines || !lines.length) {
+        container.innerHTML = '<div class="tl" style="color:var(--muted)">Нет данных</div>';
+        return;
+    }
+    container.innerHTML = lines.map(l => {
+        let cls = 'tl';
+        if (l.includes('[Восприятие]') || l.includes('Seed')) cls += ' seed';
+        else if (l.includes('[Такт')) cls += ' tick';
+        else if (l.includes('[Стоп]')) cls += ' stop';
+        else if (l.includes('[Итог]')) cls += ' ok';
+        else if (l.includes('-->')) cls += ' spread';
+        return `<div class="${cls}">${esc(l)}</div>`;
+    }).join('');
+    container.scrollTop = container.scrollHeight;
+}
+
+async function doIgnite() {
+    const seeds = document.getElementById('seed-in').value.split(',').map(s=>s.trim()).filter(Boolean);
+    if (!seeds.length) { alert('Введите seed-концепты'); return; }
+    const tb = document.getElementById('trace-box');
+    tb.innerHTML = '<div class="tl tick">⏳ Воспламенение…</div>';
+    try {
+        const r = await fetch('/api/ignite', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({seed:seeds})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+            renderTrace(d.trace || [], tb);
+            if (d.not_found && d.not_found.length)
+                tb.innerHTML += `<div class="tl stop">⚠ Не найдены: ${esc(d.not_found.join(', '))}</div>`;
+            tb.innerHTML += `<div class="tl ok">✅ Активировано: ${(d.highlight_uids||[]).length} узлов</div>`;
+            highlightNodes(d.highlight_uids || [], '#ff9800');
+            refreshStats();
+        } else {
+            tb.innerHTML = `<div class="tl stop">❌ ${esc(d.message)}</div>`;
+        }
+    } catch (e) { tb.innerHTML = `<div class="tl stop">❌ ${esc(e.message)}</div>`; }
+}
+
+async function askAgent() {
+    const inp = document.getElementById('chat-in');
+    const q = inp.value.trim();
+    if (!q) return;
+    const cm = document.getElementById('chat-msgs');
+    const ct = document.getElementById('chat-trace');
+    cm.innerHTML += `<div class="msg-user">🧑 ${esc(q)}</div>`;
+    inp.value = '';
+    cm.scrollTop = cm.scrollHeight;
+    ct.innerHTML = '<div class="tl tick">⏳ Думаю…</div>';
+    try {
+        const r = await fetch('/api/ask', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({question:q})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+            cm.innerHTML += `<div class="msg-agent">🤖 ${esc(d.answer)}</div>`;
+            renderTrace(d.trace || [], ct);
+
+            if (d.trace_graph && d.trace_graph.nodes && d.trace_graph.nodes.length > 0) {
+                showTraceGraph(d.trace_graph);
+            } else if (d.highlight_uids && d.highlight_uids.length) {
+                highlightNodes(d.highlight_uids, '#58a6ff');
+            }
+        } else {
+            cm.innerHTML += `<div class="msg-agent msg-err">❌ ${esc(d.message)}</div>`;
+            ct.innerHTML = `<div class="tl stop">❌ ${esc(d.message)}</div>`;
+        }
+        cm.scrollTop = cm.scrollHeight;
+    } catch (e) {
+        cm.innerHTML += `<div class="msg-agent msg-err">❌ ${esc(e.message)}</div>`;
+        cm.scrollTop = cm.scrollHeight;
+    }
+}
+
+async function extractFact() {
+    const s = document.getElementById('f-sent').value.trim();
+    if (!s) { alert('Введите предложение'); return; }
+    const rd = document.getElementById('f-res');
+    rd.innerHTML = '<span style="color:var(--muted)">⏳ LLM извлекает…</span>';
+    try {
+        const r = await fetch('/api/extract_fact', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({sentence:s})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+            rd.innerHTML = `<div style="color:var(--green)">✅ <b>${esc(d.fact.predicate)}</b>(${esc(d.fact.subject)}, ${esc(d.fact.object)}) [${esc(d.fact.template)}]</div>`;
+            highlightNodes(d.highlight_uids || [], '#ffeb3b');
+            refreshStats();
+        } else {
+            rd.innerHTML = `<div style="color:var(--red)">❌ ${esc(d.message)}</div>`;
+        }
+    } catch (e) { rd.innerHTML = `<div style="color:var(--red)">❌ ${esc(e.message)}</div>`; }
+}
+
+async function addFactMan() {
+    const p = document.getElementById('f-pred').value.trim();
+    const s = document.getElementById('f-subj').value.trim();
+    const o = document.getElementById('f-obj').value.trim();
+    const t = document.getElementById('f-tmpl').value;
+    const rd = document.getElementById('f-man-res');
+    if (!p||!s||!o) { rd.innerHTML='<div style="color:var(--red)">Заполните все поля</div>'; return; }
+    try {
+        const r = await fetch('/api/add_fact', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({predicate:p, subject:s, object:o, template:t})
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+            rd.innerHTML = `<div style="color:var(--green)">✅ ${esc(p)}(${esc(s)}, ${esc(o)})</div>`;
+            highlightNodes(d.highlight_uids || [], '#ffeb3b');
+            refreshStats();
+        } else {
+            rd.innerHTML = `<div style="color:var(--red)">❌ ${esc(d.message)}</div>`;
+        }
+    } catch (e) { rd.innerHTML = `<div style="color:var(--red)">❌ ${esc(e.message)}</div>`; }
+}
+
+async function refreshLog() {
+    try {
+        const r = await fetch('/api/logs'); const d = await r.json();
+        document.getElementById('sys-log').textContent = (d.logs||[]).join('\n') || '(пусто)';
+    } catch(e) {}
+}
+
+async function refreshStats() {
+    try {
+        const r = await fetch('/api/stats'); const d = await r.json();
+        if (d.status==='ok') {
+            const s=d.stats;
+            document.getElementById('sS').textContent=s.S||0;
+            document.getElementById('sC').textContent=s.C||0;
+            document.getElementById('sP').textContent=s.P||0;
+            document.getElementById('sH').textContent=s.H||0;
+            document.getElementById('sL').textContent=s.L||0;
+        }
+    } catch(e) {}
+}
+
+function esc(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+window.addEventListener('load', () => { loadGraph(); refreshStats(); setInterval(refreshStats, 15000); });
+</script>
+</body>
+</html>
