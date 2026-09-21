@@ -9,13 +9,19 @@ run_metrics.py — расчёт метрик для хакатона «Восп�
 оценивает ответы через GigaChat и считает:
   - базовые: completeness, accuracy, explainability, factual_consistency
   - производные: delta_explainability, delta_factual, hallucination
-  - M2: ExplainScore (глубина трассировки)
+  - M2: ExplainScore (глубина трассировки × correct)
   - M4: Δ_explainability (trace_score_AG − trace_score_RAG)
   - M5: RobustnessGain (устойчивость между моделями)
 
 Запуск:
     python run_metrics.py --models qwen2.5:7b qwen2.5:14b qwen2.5:32b --limit 20
     python run_metrics.py --models qwen2.5:7b --limit 5   # быстрый тест
+
+Изменения:
+  - chain_depth теперь использует неориентированный BFS
+    (в графе рёбра направлены от фактов к символам, поэтому
+     направленный BFS от seed-узлов давал depth=0);
+  - M2 учитывает правильность ответа (correct_i) через оценку судьи.
 """
 
 import os
@@ -55,7 +61,8 @@ OLLAMA_URL = "http://localhost:11434"
 AG_API_URL = "http://localhost:5000/api/ask"
 
 
-def ollama_generate(model: str, prompt: str, temperature: float = 0.2, max_tokens: int = 500) -> str:
+def ollama_generate(model: str, prompt: str,
+                    temperature: float = 0.2, max_tokens: int = 500) -> str:
     """Запрос к Ollama /api/chat."""
     try:
         resp = requests.post(
@@ -130,7 +137,8 @@ class AGSystem:
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            return {"status": "error", "answer": f"[AG error: {e}]", "trace_graph": {}}
+            return {"status": "error", "answer": f"[AG error: {e}]",
+                    "trace_graph": {"nodes": [], "edges": [], "seed_uids": []}}
 
     def answer(self, question: str, model: str) -> str:
         return self.ask(question, model).get("answer", "")
@@ -143,23 +151,28 @@ class Judge:
     def __init__(self):
         self.client = get_giga_client() if HAS_JUDGE else None
 
-    def evaluate(self, question: str, answer: str, reference: str) -> Dict[str, float]:
+    def evaluate(self, question: str, answer: str,
+                 reference: str) -> Dict[str, float]:
         default = {"completeness": 3.0, "accuracy": 3.0,
                    "explainability": 3.0, "factual_consistency": 3.0}
         if not self.client:
             return default
 
-        prompt = f"""Ты — эксперт по оценке ответов ИИ-систем. Оцени ответ по четырём критериям (1–5). Выдай только JSON:
-{{"completeness": число, "accuracy": число, "explainability": число, "factual_consistency": число}}
-
-Вопрос: {question}
-Эталон: {reference}
-Ответ: {answer}
-Оценка:"""
+        prompt = (
+            "Ты — эксперт по оценке ответов ИИ-систем. "
+            "Оцени ответ по четырём критериям (1–5). Выдай только JSON:\n"
+            '{"completeness": число, "accuracy": число, '
+            '"explainability": число, "factual_consistency": число}\n\n'
+            f"Вопрос: {question}\n"
+            f"Эталон: {reference}\n"
+            f"Ответ: {answer}\n"
+            "Оценка:"
+        )
         try:
             resp = self.client.chat({
                 "messages": [
-                    {"role": "system", "content": "Ты — строгий эксперт. Отвечай только JSON."},
+                    {"role": "system",
+                     "content": "Ты — строгий эксперт. Отвечай только JSON."},
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0.1,
@@ -190,16 +203,29 @@ def trace_score(response_json: Dict) -> float:
 
 
 def chain_depth(response_json: Dict) -> int:
-    """Длина самой длинной цепочки в trace_graph (BFS)."""
+    """
+    Длина самой длинной цепочки в trace_graph.
+
+    ИСПРАВЛЕНО: неориентированный BFS.
+    В графе АГ-памяти рёбра идут от фактов к символам
+    (fact --SUBJECT--> symbol), поэтому направленный BFS
+    от seed-узлов давал depth=0. Неориентированный обход
+    корректно проходит по всем связям вокруг seed.
+    """
     tg = response_json.get("trace_graph", {})
     nodes = tg.get("nodes", [])
     edges = tg.get("edges", [])
     if not nodes:
         return 0
 
+    # Строим НЕориентированный список смежности
     adj = {}
     for e in edges:
-        adj.setdefault(e["from"], []).append(e["to"])
+        u, v = e.get("from"), e.get("to")
+        if u is None or v is None:
+            continue
+        adj.setdefault(u, []).append(v)
+        adj.setdefault(v, []).append(u)
 
     seeds = set(tg.get("seed_uids", []))
     if not seeds:
@@ -218,6 +244,15 @@ def chain_depth(response_json: Dict) -> int:
             if nxt not in visited:
                 queue.append((nxt, d + 1))
     return max_depth
+
+
+def is_correct(ag_scores: Dict[str, float]) -> float:
+    """
+    Оценка correct_i ∈ [0, 1] для M2.
+    Считаем ответ правильным, если судья поставил factual_consistency ≥ 3.5.
+    Иначе — 0 (вклад вопроса в M2 обнуляется).
+    """
+    return 1.0 if ag_scores.get("factual_consistency", 0.0) >= 3.5 else 0.0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -262,6 +297,7 @@ def run_for_model(model: str, dataset_path: str, limit: Optional[int],
         ag_scores = judge.evaluate(q, ag_ans, ref)
         ag_trace = trace_score(ag_resp)
         ag_depth = chain_depth(ag_resp)
+        correct = is_correct(ag_scores)
 
         rows.append({
             "question": q,
@@ -283,12 +319,24 @@ def run_for_model(model: str, dataset_path: str, limit: Optional[int],
             "ag_trace_score": ag_trace,
             "rag_chain_depth": rag_depth,
             "ag_chain_depth": ag_depth,
+            "ag_correct": correct,
         })
 
         print(f"     RAG expl={rag_scores['explainability']:.1f}  |  "
-              f"AG expl={ag_scores['explainability']:.1f}  trace={ag_trace:.0f}  depth={ag_depth}")
+              f"AG expl={ag_scores['explainability']:.1f}  "
+              f"trace={ag_trace:.0f}  depth={ag_depth}  correct={correct:.0f}")
 
     df_res = pd.DataFrame(rows)
+
+    # ── M2: ExplainScore (упрощённый по постановке) ──
+    # M2 = (1/N) · Σ [correct_i · (d_i / d_max) · trace_complete_i]
+    d_max = 6.0
+    m2_per_question = (
+        df_res["ag_correct"]
+        * (df_res["ag_chain_depth"] / d_max)
+        * df_res["ag_trace_score"]
+    )
+    m2_ag = m2_per_question.mean()
 
     # ── Агрегация по модели ──
     summary = {
@@ -305,20 +353,25 @@ def run_for_model(model: str, dataset_path: str, limit: Optional[int],
         "ag_explainability": df_res["ag_explainability"].mean(),
         "ag_factual_consistency": df_res["ag_factual_consistency"].mean(),
 
-        "delta_explainability": df_res["ag_explainability"].mean() - df_res["rag_explainability"].mean(),
-        "delta_factual": df_res["ag_factual_consistency"].mean() - df_res["rag_factual_consistency"].mean(),
+        "delta_explainability": (df_res["ag_explainability"].mean()
+                                 - df_res["rag_explainability"].mean()),
+        "delta_factual": (df_res["ag_factual_consistency"].mean()
+                          - df_res["rag_factual_consistency"].mean()),
         "hallucination_rag": 6.0 - df_res["rag_factual_consistency"].mean(),
         "hallucination_ag": 6.0 - df_res["ag_factual_consistency"].mean(),
-        "delta_hallucination": (6.0 - df_res["rag_factual_consistency"].mean())
-                              - (6.0 - df_res["ag_factual_consistency"].mean()),
+        "delta_hallucination": ((6.0 - df_res["rag_factual_consistency"].mean())
+                                - (6.0 - df_res["ag_factual_consistency"].mean())),
 
         "M2_rag": 0.0,
-        "M2_ag": (df_res["ag_trace_score"] * df_res["ag_chain_depth"] / 6.0).mean(),
+        "M2_ag": m2_ag,
 
-        "M4_delta_trace": df_res["ag_trace_score"].mean() - df_res["rag_trace_score"].mean(),
-        "M4_delta_expl": df_res["ag_explainability"].mean() - df_res["rag_explainability"].mean(),
+        "M4_delta_trace": (df_res["ag_trace_score"].mean()
+                           - df_res["rag_trace_score"].mean()),
+        "M4_delta_expl": (df_res["ag_explainability"].mean()
+                          - df_res["rag_explainability"].mean()),
 
         "avg_chain_depth_ag": df_res["ag_chain_depth"].mean(),
+        "correct_rate_ag": df_res["ag_correct"].mean(),
     }
 
     return summary, df_res
@@ -352,9 +405,10 @@ def print_final_report(summaries: List[Dict]):
         ("Hallucination RAG", "hallucination_rag", "{:.2f}"),
         ("Hallucination AG", "hallucination_ag", "{:.2f}"),
         ("Δ Hallucination", "delta_hallucination", "{:+.2f}"),
-        ("M2 AG", "M2_ag", "{:.2f}"),
+        ("M2 AG", "M2_ag", "{:.3f}"),
         ("M4 Δ trace", "M4_delta_trace", "{:+.2f}"),
-        ("Ср. длина цепочки", "avg_chain_depth_ag", "{:.1f}"),
+        ("Ср. длина цепочки", "avg_chain_depth_ag", "{:.2f}"),
+        ("Correct rate AG", "correct_rate_ag", "{:.2f}"),
     ]
 
     for label, key, fmt in metrics:
@@ -369,18 +423,18 @@ def print_final_report(summaries: List[Dict]):
         small = sorted_s[0]
         large = sorted_s[-1]
 
-        f1_ag_small = small["M2_ag"] if small["M2_ag"] > 0 else small["ag_factual_consistency"] / 5.0
-        f1_ag_large = large["M2_ag"] if large["M2_ag"] > 0 else large["ag_factual_consistency"] / 5.0
+        f1_ag_small = small["M2_ag"]
+        f1_ag_large = large["M2_ag"]
         f1_rag_small = small["rag_factual_consistency"] / 5.0
         f1_rag_large = large["rag_factual_consistency"] / 5.0
 
         robustness_gain = (f1_ag_large - f1_ag_small) - (f1_rag_large - f1_rag_small)
         print(f"   Модель small:  {small['model']}")
         print(f"   Модель large:  {large['model']}")
-        print(f"   F1 AG small:   {f1_ag_small:.3f}")
-        print(f"   F1 AG large:   {f1_ag_large:.3f}")
-        print(f"   F1 RAG small:  {f1_rag_small:.3f}")
-        print(f"   F1 RAG large:  {f1_rag_large:.3f}")
+        print(f"   M2 AG small:   {f1_ag_small:.3f}")
+        print(f"   M2 AG large:   {f1_ag_large:.3f}")
+        print(f"   RAG small:     {f1_rag_small:.3f}")
+        print(f"   RAG large:     {f1_rag_large:.3f}")
         print(f"   RobustnessGain = {robustness_gain:+.3f}   "
               f"{'✅ гипотеза подтверждена' if robustness_gain > 0 else '❌ гипотеза опровергнута'}")
 
@@ -390,8 +444,8 @@ def print_final_report(summaries: List[Dict]):
     print("   они требуют ручной разметки и сборщика мусора соответственно.")
     print("━" * 70)
 
-    m2 = np.mean([s["M2_ag"] for s in summaries])
-    m4 = np.mean([s["M4_delta_expl"] for s in summaries])
+    m2 = float(np.mean([s["M2_ag"] for s in summaries]))
+    m4 = float(np.mean([s["M4_delta_expl"] for s in summaries]))
     m5 = robustness_gain
 
     partial = 0.30 * m2 + 0.20 * m4 + 0.15 * m5
@@ -400,7 +454,8 @@ def print_final_report(summaries: List[Dict]):
     print(f"🎯 Частичный балл (M2 + M4 + M5):")
     print(f"   0.30·{m2:.3f} + 0.20·{m4:.3f} + 0.15·{m5:.3f} = {partial:.3f}")
     print(f"   Из максимума {max_partial:.2f} (без M1 и M3)")
-    print(f"   Нормированный: {partial / max_partial:.3f}")
+    if max_partial > 0:
+        print(f"   Нормированный: {partial / max_partial:.3f}")
     print("━" * 70)
 
 
@@ -460,7 +515,9 @@ def main():
             )
             summaries.append(summary)
 
-            detail_path = os.path.join(args.output_dir, f"details_{model.replace(':', '_')}.csv")
+            detail_path = os.path.join(
+                args.output_dir, f"details_{model.replace(':', '_')}.csv"
+            )
             df_res.to_csv(detail_path, index=False, encoding="utf-8")
             print(f"   💾 Детали: {detail_path}")
 
