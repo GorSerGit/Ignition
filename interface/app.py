@@ -3,7 +3,8 @@
 """
 Веб-приложение «Воспламенение 1.0»
 Flask + vis.js
-Модификация: генерация ответа через Ollama (поддержка параметра model)
+Генерация ответа через Ollama (поддержка параметра model)
+ИСПРАВЛЕНО: trace_graph корректно строится из UID'ов ролей и предиката.
 """
 import os
 import sys
@@ -40,6 +41,8 @@ db_path = None
 corpus_text = None
 parse_status = {"running": False, "progress": 0, "log": ""}
 log_messages = []
+
+DEFAULT_MODEL = "qwen2.5:7b"
 
 
 # =============================================================================
@@ -97,10 +100,53 @@ def find_symbol_fuzzy(word: str):
     return None
 
 
+def _load_symbol_labels(uid_set):
+    """Загружает метки символов для указанных UID одним запросом."""
+    labels = {}
+    if not uid_set:
+        return labels
+    try:
+        placeholders = ','.join(['?'] * len(uid_set))
+        rows = db.conn.execute(
+            f"SELECT uid, r_text FROM symbols WHERE uid IN ({placeholders})",
+            list(uid_set)
+        ).fetchall()
+        for uid, r_text_json in rows:
+            try:
+                r_text = json.loads(r_text_json)
+                label = r_text[0] if r_text else uid[:8]
+                labels[uid] = clean_label(label) or uid[:8]
+            except Exception:
+                labels[uid] = uid[:8]
+    except Exception as e:
+        add_log(f"⚠ Ошибка загрузки меток: {e}", "ERROR")
+    return labels
+
+
+def _load_facts_data(uid_set):
+    """Загружает мета-данные фактов для указанных UID."""
+    facts_data = {}
+    if not uid_set:
+        return facts_data
+    try:
+        placeholders = ','.join(['?'] * len(uid_set))
+        rows = db.conn.execute(
+            f"SELECT uid, mt FROM facts WHERE uid IN ({placeholders})",
+            list(uid_set)
+        ).fetchall()
+        for uid, mt_json in rows:
+            try:
+                facts_data[uid] = json.loads(mt_json)
+            except Exception:
+                pass
+    except Exception as e:
+        add_log(f"⚠ Ошибка загрузки фактов: {e}", "ERROR")
+    return facts_data
+
+
 def _build_trace_subgraph(uids, steps=0):
     """
-    Строит подграф из указанных UID со ВСЕМИ связями между ними.
-    steps=0 — без расширения, только сами узлы и связи между ними.
+    Строит подграф из указанных UID со связями между ними.
     Возвращает (nodes_data, edges_data).
     """
     if not db or not uids:
@@ -108,26 +154,9 @@ def _build_trace_subgraph(uids, steps=0):
 
     uid_set = set(str(u) for u in uids)
 
-    # Загружаем метки символов только для нужных узлов
-    symbol_labels = {}
-    for s in db.get_all_symbols():
-        if s.uid in uid_set:
-            label = s.r_text[0] if s.r_text else s.uid[:8]
-            symbol_labels[s.uid] = clean_label(label) or s.uid[:8]
-
-    # Загружаем факты
-    facts_data = {}
-    if uid_set:
-        placeholders = ','.join(['?'] * len(uid_set))
-        facts_rows = db.conn.execute(
-            f"SELECT uid, mt FROM facts WHERE uid IN ({placeholders})",
-            list(uid_set)
-        ).fetchall()
-        for uid, mt_json in facts_rows:
-            try:
-                facts_data[uid] = json.loads(mt_json)
-            except Exception:
-                pass
+    # Загружаем метки символов и данные фактов — только для нужных UID
+    symbol_labels = _load_symbol_labels(uid_set)
+    facts_data = _load_facts_data(uid_set)
 
     # Формируем nodes_data
     nodes_data = []
@@ -142,8 +171,8 @@ def _build_trace_subgraph(uids, steps=0):
             roles = mt.get("roles", {})
 
             pred_label = symbol_labels.get(pred_uid, "?") if pred_uid else "?"
-            subject_label = symbol_labels.get(roles.get("SUBJECT"), "") if roles.get("SUBJECT") else ""
-            object_label = symbol_labels.get(roles.get("OBJECT"), "") if roles.get("OBJECT") else ""
+            subject_label = symbol_labels.get(roles.get("SUBJECT", ""), "") if roles.get("SUBJECT") else ""
+            object_label = symbol_labels.get(roles.get("OBJECT", ""), "") if roles.get("OBJECT") else ""
 
             if subject_label and object_label:
                 label = f"{pred_label}({subject_label}, {object_label})"
@@ -162,25 +191,29 @@ def _build_trace_subgraph(uids, steps=0):
             "id": str(uid),
             "label": label,
             "color": color,
-            "type": ntype
+            "type": ntype,
         })
 
-    # 🔥 Собираем ВСЕ связи между выбранными узлами ОДНИМ запросом
+    # Собираем связи между выбранными узлами одним запросом
     edges_data = []
     seen_edges = set()
 
     if uid_set:
-        placeholders = ','.join(['?'] * len(uid_set))
-        links_rows = db.conn.execute(
-            f"SELECT e1, e2, link_id, w FROM links WHERE e1 IN ({placeholders}) OR e2 IN ({placeholders})",
-            list(uid_set) + list(uid_set)
-        ).fetchall()
+        try:
+            placeholders = ','.join(['?'] * len(uid_set))
+            links_rows = db.conn.execute(
+                f"SELECT e1, e2, link_id, w FROM links "
+                f"WHERE e1 IN ({placeholders}) OR e2 IN ({placeholders})",
+                list(uid_set) + list(uid_set)
+            ).fetchall()
 
-        for e1, e2, lid, w in links_rows:
-            if e1 in uid_set and e2 in uid_set:
-                edge_key = (str(e1), str(e2))
-                if edge_key not in seen_edges:
+            for e1, e2, lid, w in links_rows:
+                if e1 in uid_set and e2 in uid_set:
+                    edge_key = (str(e1), str(e2), str(lid))
+                    if edge_key in seen_edges:
+                        continue
                     seen_edges.add(edge_key)
+
                     try:
                         weight = float(w) if w else 0.5
                     except Exception:
@@ -196,20 +229,22 @@ def _build_trace_subgraph(uids, steps=0):
                         "width": float(weight) * 2.5 if is_structural else float(weight) * 1.5,
                         "color": {
                             "color": '#ff6b6b' if link_type == "PREDICATE" else
-                                    '#51cf66' if link_type in ["SUBJECT", "OBJECT"] else
-                                    '#ffd43b' if link_type == "IS-A" else
-                                    '#74c0fc' if link_type == "FOLLOW" else
-                                    '#868e96',
-                            "highlight": '#ff9800'
+                                     '#51cf66' if link_type in ["SUBJECT", "OBJECT"] else
+                                     '#ffd43b' if link_type == "IS-A" else
+                                     '#74c0fc' if link_type == "FOLLOW" else
+                                     '#868e96',
+                            "highlight": '#ff9800',
                         },
                         "font": {
                             "color": '#e6edf3',
                             "size": 11,
                             "strokeWidth": 2,
-                            "strokeColor": '#010409'
+                            "strokeColor": '#010409',
                         },
-                        "arrows": "to" if link_type in ["SUBJECT", "OBJECT", "PREDICATE"] else "none"
+                        "arrows": "to" if link_type in ["SUBJECT", "OBJECT", "PREDICATE"] else "none",
                     })
+        except Exception as e:
+            add_log(f"⚠ Ошибка загрузки связей для trace: {e}", "ERROR")
 
     return nodes_data, edges_data
 
@@ -282,21 +317,24 @@ def _get_top_nodes(n=20):
 # =============================================================================
 # ГЕНЕРАЦИЯ ЧЕРЕЗ OLLAMA
 # =============================================================================
-def generate_with_ollama(prompt: str, model: str, temperature: float = 0.2, max_tokens: int = 500) -> str:
+def generate_with_ollama(prompt: str, model: str,
+                         temperature: float = 0.2, max_tokens: int = 500) -> str:
     """Отправляет запрос к локальному Ollama и возвращает сгенерированный текст."""
     url = "http://localhost:11434/api/generate"
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+        "options": {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+            "repeat_penalty": 1.1,
+        },
     }
     try:
-        resp = requests.post(url, json=payload, timeout=120)
+        resp = requests.post(url, json=payload, timeout=180)
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("response", "").strip()
+        return resp.json().get("response", "").strip()
     except Exception as e:
         add_log(f"Ошибка вызова Ollama: {e}", "ERROR")
         return f"[Ошибка генерации: {e}]"
@@ -453,7 +491,7 @@ def get_graph():
                 "id": str(n),
                 "label": label,
                 "color": color,
-                "type": G.nodes[n].get('type')
+                "type": G.nodes[n].get('type'),
             })
 
         edges_data = []
@@ -464,7 +502,7 @@ def get_graph():
                 weight = 0.5
             edges_data.append({
                 "from": str(u), "to": str(v),
-                "label": edge_label, "width": float(weight) * 2
+                "label": edge_label, "width": float(weight) * 2,
             })
 
         return jsonify({"status": "ok", "nodes": nodes_data, "edges": edges_data})
@@ -514,18 +552,17 @@ def ignite():
         "seed_uids": seed_uids,
         "trace": result["trace_log"],
         "highlight_uids": list(highlighted),
-        "not_found": not_found
+        "not_found": not_found,
     })
 
 
-# ========== ИЗМЕНЁННЫЙ МАРШРУТ: использует Ollama ==========
 @app.route('/api/ask', methods=['POST'])
 def ask_agent():
     if not db:
         return jsonify({"status": "error", "message": "БД не загружена"}), 400
     data = request.get_json()
     question = data.get('question', '').strip()
-    model_name = data.get('model', 'llama3.1:8b')   # модель для Ollama
+    model_name = data.get('model', DEFAULT_MODEL)
     if not question:
         return jsonify({"status": "error", "message": "Вопрос пуст"}), 400
     try:
@@ -535,8 +572,9 @@ def ask_agent():
                 "status": "ok",
                 "answer": "Не удалось найти концепты в графе.",
                 "trace": ["Не найдено seed-узлов"],
-                "facts": [], "highlight_uids": [],
-                "trace_graph": {"nodes": [], "edges": []}
+                "facts": [],
+                "highlight_uids": [],
+                "trace_graph": {"nodes": [], "edges": [], "seed_uids": []},
             })
 
         result = engine.query(seed_uids)
@@ -547,54 +585,77 @@ def ask_agent():
             return jsonify({
                 "status": "ok",
                 "answer": "В графе не нашлось фактов для ответа.",
-                "trace": trace, "facts": [],
+                "trace": trace,
+                "facts": [],
                 "highlight_uids": list(seed_uids),
-                "trace_graph": {"nodes": [], "edges": []}
+                "trace_graph": {"nodes": [], "edges": [], "seed_uids": [str(u) for u in seed_uids]},
             })
 
+        # Сортировка фактов по максимальной активации участников
         activations = result["activations"]
         for f in all_facts:
-            role_uids = [v for v in f.get("roles", {}).values() if isinstance(v, str)]
-            role_uids.append(f.get("predicate_uid", ""))
-            f["_max_activation"] = max([activations.get(u, 0.0) for u in role_uids] + [0.0])
+            uids_for_score = []
+            if f.get("uid"):
+                uids_for_score.append(f["uid"])
+            if f.get("predicate_uid"):
+                uids_for_score.append(f["predicate_uid"])
+            for role_uid in f.get("roles_uids", {}).values():
+                if isinstance(role_uid, str):
+                    uids_for_score.append(role_uid)
+
+            f["_max_activation"] = max(
+                [activations.get(u, 0.0) for u in uids_for_score] + [0.0]
+            )
 
         all_facts.sort(key=lambda f: -f["_max_activation"])
         facts = all_facts[:5]
 
+        # Формируем контекст для промпта
         ctx = ""
         for i, f in enumerate(facts):
             roles = ", ".join(f"{k}: {v}" for k, v in f["roles"].items())
             ctx += f"Факт {i+1}: [{f['predicate']}] {roles}.\n"
 
-        prompt = f"Ты — биолог-эксперт. Отвечай СТРОГО на основе фактов. Кратко.\n\nВопрос: {question}\n\nФакты:\n{ctx}\n\nОтвет:"
-        # Генерация через Ollama
+        prompt = (
+            "Ты — биолог-эксперт. Отвечай СТРОГО на основе фактов. Кратко.\n\n"
+            f"Вопрос: {question}\n\n"
+            f"Факты:\n{ctx}\n\n"
+            "Ответ:"
+        )
         answer = generate_with_ollama(prompt, model_name, temperature=0.2, max_tokens=500)
         add_log(f"Ответ на: {question[:50]}...")
 
+        # Собираем множество UID'ов для trace_graph
         hl = set(seed_uids)
         for f in facts:
             if f.get("uid"):
                 hl.add(f["uid"])
             if f.get("predicate_uid"):
                 hl.add(f["predicate_uid"])
-            for role_name, role_value in f.get("roles", {}).items():
-                if role_value and isinstance(role_value, str):
-                    hl.add(role_value)
+            for role_uid in f.get("roles_uids", {}).values():
+                if isinstance(role_uid, str):
+                    hl.add(role_uid)
 
         trace_nodes, trace_edges = _build_trace_subgraph(list(hl), steps=0)
 
+        add_log(f"🔍 trace: узлов={len(trace_nodes)}, рёбер={len(trace_edges)}, hl={len(hl)}")
+
         return jsonify({
-            "status": "ok", "answer": answer,
-            "trace": trace, "facts": facts,
+            "status": "ok",
+            "answer": answer,
+            "trace": trace,
+            "facts": facts,
             "highlight_uids": list(hl),
             "trace_graph": {
                 "nodes": trace_nodes,
                 "edges": trace_edges,
-                "seed_uids": [str(u) for u in seed_uids]
-            }
+                "seed_uids": [str(u) for u in seed_uids],
+            },
         })
     except Exception as e:
         add_log(f"Ошибка агента: {e}", "ERROR")
+        import traceback
+        add_log(traceback.format_exc(), "ERROR")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -620,9 +681,9 @@ def extract_fact():
         resp = client.chat({
             "messages": [
                 {"role": "system", "content": "Лингвист. Только JSON."},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
-            "temperature": 0.1, "max_tokens": 250
+            "temperature": 0.1, "max_tokens": 250,
         })
         ans = resp.choices[0].message.content.strip()
         m = re.search(r'\{[^{}]+\}', ans, re.DOTALL)
@@ -639,7 +700,7 @@ def extract_fact():
             "predicate": fd["predicate"],
             "template": fd.get("template", "PRODUCE"),
             "roles": {"SUBJECT": fd["subject"], "OBJECT": fd["object"]},
-            "_source_text": sentence
+            "_source_text": sentence,
         }
         node = memory.ingest_parsed_fact(fact)
         if not node:
@@ -654,7 +715,7 @@ def extract_fact():
 
         return jsonify({
             "status": "ok", "fact": fd, "uid": node.uid,
-            "highlight_uids": hl, "message": "Факт добавлен"
+            "highlight_uids": hl, "message": "Факт добавлен",
         })
     except Exception as e:
         add_log(f"Ошибка extract_fact: {e}", "ERROR")
@@ -675,7 +736,7 @@ def add_fact_api():
     fact = {
         "predicate": pred, "template": tmpl,
         "roles": {"SUBJECT": subj, "OBJECT": obj},
-        "_source_text": "Ручной ввод"
+        "_source_text": "Ручной ввод",
     }
     try:
         node = memory.ingest_parsed_fact(fact)
@@ -688,7 +749,7 @@ def add_fact_api():
                     hl.append(s.uid)
             return jsonify({
                 "status": "ok", "uid": node.uid,
-                "message": "Факт добавлен", "highlight_uids": hl
+                "message": "Факт добавлен", "highlight_uids": hl,
             })
         return jsonify({"status": "error", "message": "Не удалось"}), 500
     except Exception as e:
@@ -790,7 +851,7 @@ def load_corpus():
     add_log(f"Корпус: {len(text.split())} слов")
     return jsonify({
         "status": "ok", "word_count": len(text.split()),
-        "preview": text[:500]
+        "preview": text[:500],
     })
 
 
@@ -812,4 +873,4 @@ if __name__ == '__main__':
             print(f"❌ Ошибка автозагрузки: {e}")
     else:
         print(f"⚠️ БД не найдена: {default_db}")
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)
